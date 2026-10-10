@@ -1,0 +1,53 @@
+# Mode "Docker nu" : n'importe quel VPS avec Docker + Compose v2.
+# Pour Coolify / Dokploy, utiliser deploy/panel.compose.yaml (voir docs/PANELS.md).
+# Toute la personnalisation client passe par .env (variables) et mailserver.env (réglages DMS).
+
+services:
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:${DMS_IMAGE_TAG:-latest}
+    container_name: mailserver
+    hostname: ${MAIL_HOSTNAME:?définir MAIL_HOSTNAME dans .env}
+    env_file: mailserver.env
+    environment:
+      TZ: ${TZ:-UTC}
+      POSTMASTER_ADDRESS: ${POSTMASTER_ADDRESS:?définir POSTMASTER_ADDRESS dans .env}
+      ENABLE_CLAMAV: ${ENABLE_CLAMAV:-0}
+      POSTFIX_MESSAGE_SIZE_LIMIT: ${POSTFIX_MESSAGE_SIZE_LIMIT:-26214400}
+      SSL_TYPE: letsencrypt # certbot / Cloudflare DNS / auto-signé / certificat fourni : tous finissent dans data/certbot
+    ports:
+      - "25:25" # SMTP entrant (MX) : pas d'authentification
+      - "465:465" # SMTP soumission TLS implicite
+      - "587:587" # SMTP soumission STARTTLS
+      - "993:993" # IMAP TLS implicite
+    volumes:
+      - ./data/mail-data/:/var/mail/
+      - ./data/mail-state/:/var/mail-state/
+      - ./data/mail-logs/:/var/log/mail/
+      - ./data/config/:/tmp/docker-mailserver/
+      - ./data/certbot/:/etc/letsencrypt/:ro
+      - ./templates/rspamd/override.d/dkim_signing.conf:/tmp/docker-mailserver/rspamd/override.d/dkim_signing.conf:ro
+      - /etc/localtime:/etc/localtime:ro
+    cap_add:
+      - NET_ADMIN # requis par Fail2ban
+    stop_grace_period: 1m
+    restart: always
+
+  # Webmail optionnel : COMPOSE_PROFILES=webmail dans .env.
+  # Écoute en local uniquement ; à exposer via un reverse proxy (voir README).
+  webmail:
+    profiles: [webmail]
+    image: roundcube/roundcubemail:latest-apache
+    container_name: webmail
+    environment:
+      ROUNDCUBEMAIL_DEFAULT_HOST: ssl://${MAIL_HOSTNAME}
+      ROUNDCUBEMAIL_DEFAULT_PORT: 993
+      ROUNDCUBEMAIL_SMTP_SERVER: tls://${MAIL_HOSTNAME}
+      ROUNDCUBEMAIL_SMTP_PORT: 587
+      ROUNDCUBEMAIL_PLUGINS: archive,zipdownload
+    volumes:
+      - ./data/webmail/:/var/roundcube/db/
+    ports:
+      - "127.0.0.1:${WEBMAIL_PORT:-8080}:80"
+    depends_on:
+      - mailserver
+    restart: always

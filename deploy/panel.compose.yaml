@@ -1,0 +1,61 @@
+# Mode Coolify / Dokploy (Docker Compose "git repo" ou "raw").
+# Le certificat TLS est repris du Traefik du panel : le webmail est servi sur MAIL_HOSTNAME,
+# donc Traefik émet le certificat de ce nom et DMS le relit dans acme.json (SSL_DOMAIN).
+# Variables à définir dans l'interface du panel : voir .env.example et docs/PANELS.md.
+
+services:
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:${DMS_IMAGE_TAG:-latest}
+    container_name: mailserver
+    hostname: ${MAIL_HOSTNAME:?définir MAIL_HOSTNAME}
+    env_file: ../mailserver.env
+    environment:
+      TZ: ${TZ:-UTC}
+      POSTMASTER_ADDRESS: ${POSTMASTER_ADDRESS:?définir POSTMASTER_ADDRESS}
+      ENABLE_CLAMAV: ${ENABLE_CLAMAV:-0}
+      POSTFIX_MESSAGE_SIZE_LIMIT: ${POSTFIX_MESSAGE_SIZE_LIMIT:-26214400}
+      SSL_TYPE: letsencrypt
+      SSL_DOMAIN: ${MAIL_HOSTNAME}
+    ports:
+      - "25:25"
+      - "465:465"
+      - "587:587"
+      - "993:993"
+    volumes:
+      - mail-data:/var/mail/
+      - mail-state:/var/mail-state/
+      - mail-logs:/var/log/mail/
+      - config:/tmp/docker-mailserver/
+      # Coolify : /data/coolify/proxy/acme.json — Dokploy : /etc/dokploy/traefik/dynamic/acme.json
+      - ${ACME_JSON:?chemin de acme.json du Traefik}:/etc/letsencrypt/acme.json:ro
+      - ../templates/rspamd/override.d/dkim_signing.conf:/tmp/docker-mailserver/rspamd/override.d/dkim_signing.conf:ro
+      - /etc/localtime:/etc/localtime:ro
+    cap_add:
+      - NET_ADMIN
+    stop_grace_period: 1m
+    restart: always
+
+  # Assigner le domaine MAIL_HOSTNAME à ce service (port 80) dans l'UI du panel.
+  webmail:
+    image: roundcube/roundcubemail:latest-apache
+    container_name: webmail
+    environment:
+      ROUNDCUBEMAIL_DEFAULT_HOST: ssl://${MAIL_HOSTNAME}
+      ROUNDCUBEMAIL_DEFAULT_PORT: 993
+      ROUNDCUBEMAIL_SMTP_SERVER: tls://${MAIL_HOSTNAME}
+      ROUNDCUBEMAIL_SMTP_PORT: 587
+      ROUNDCUBEMAIL_PLUGINS: archive,zipdownload
+    volumes:
+      - webmail-db:/var/roundcube/db/
+    expose:
+      - "80"
+    depends_on:
+      - mailserver
+    restart: always
+
+volumes:
+  mail-data:
+  mail-state:
+  mail-logs:
+  config:
+  webmail-db:

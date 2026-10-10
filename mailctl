@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# mailctl — exploitation d'un serveur docker-mailserver (mode Docker nu ou panel Coolify/Dokploy).
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+DMS=${DMS_CONTAINER:-mailserver}
+CERT_DIR=$PWD/data/certbot
+
+die() { echo "erreur: $*" >&2; exit 1; }
+tty_flag() { [ -t 0 ] && echo -it || echo -i; }
+dms() { docker exec "$(tty_flag)" "$DMS" setup "$@"; }
+need_env() { [ -f .env ] || die "pas de .env : lancer './mailctl init <domaine>'"; }
+setenv() { if grep -q "^$1=" .env; then sed -i "s|^$1=.*|$1=$2|" .env; else echo "$1=$2" >> .env; fi; }
+
+ask_password() {
+  local p1 p2
+  read -r -s -p "Mot de passe : " p1; echo >&2
+  read -r -s -p "Confirmer    : " p2; echo >&2
+  [ "$p1" = "$p2" ] && [ -n "$p1" ] || die "mots de passe vides ou différents"
+  printf '%s' "$p1"
+}
+
+cmd_init() {
+  local domain=${1:-} host=${2:-}
+  [ -n "$domain" ] || read -r -p "Domaine des adresses (ex. client.com) : " domain
+  host=${host:-mail.$domain}
+  [ -f .env ] || cp .env.example .env
+  setenv MAIL_DOMAIN "$domain"
+  setenv MAIL_HOSTNAME "$host"
+  setenv POSTMASTER_ADDRESS "postmaster@$domain"
+  setenv CERT_EMAIL "admin@$domain"
+  setenv TZ "$(cat /etc/timezone 2>/dev/null || echo UTC)"
+  mkdir -p data/{mail-data,mail-state,mail-logs,config,certbot,webmail}
+  echo "OK : .env écrit pour $domain ($host). Étapes suivantes :"
+  echo "  1. ./mailctl cert http|cloudflare|selfsigned"
+  echo "  2. ./mailctl up && ./mailctl add admin@$domain && ./mailctl dkim $domain"
+  echo "  3. ./mailctl dns $domain   # records à créer chez le registrar"
+}
+
+cmd_cert() {
+  need_env
+  local mode=${1:-} host=$MAIL_HOSTNAME
+  mkdir -p "$CERT_DIR"
+  case $mode in
+    http) # port 80 libre requis
+      docker run --rm -p 80:80 -v "$CERT_DIR:/etc/letsencrypt" certbot/certbot certonly --standalone \
+        --non-interactive --agree-tos -m "$CERT_EMAIL" -d "$host" ;;
+    cloudflare)
+      [ -n "${CF_API_TOKEN:-}" ] || die "CF_API_TOKEN absent de .env"
+      (umask 077; echo "dns_cloudflare_api_token = $CF_API_TOKEN" > "$CERT_DIR/cloudflare.ini")
+      docker run --rm -v "$CERT_DIR:/etc/letsencrypt" certbot/dns-cloudflare certonly \
+        --dns-cloudflare --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
+        --non-interactive --agree-tos -m "$CERT_EMAIL" -d "$host" ;;
+    selfsigned) # test uniquement : les clients de messagerie afficheront un avertissement
+      mkdir -p "$CERT_DIR/live/$host"
+      openssl req -x509 -nodes -newkey rsa:2048 -days 365 -subj "/CN=$host" \
+        -keyout "$CERT_DIR/live/$host/privkey.pem" -out "$CERT_DIR/live/$host/fullchain.pem" ;;
+    renew) # renouvelle seulement ce qui expire dans 30 jours ; DMS recharge seul
+      docker run --rm -p 80:80 -v "$CERT_DIR:/etc/letsencrypt" certbot/certbot renew --quiet ;;
+    autorenew) # cron root, 2 fois par jour
+      [ "$(id -u)" = 0 ] || die "à lancer en root"
+      echo "17 3,15 * * * root $PWD/mailctl cert renew >> /var/log/mailctl-renew.log 2>&1" > /etc/cron.d/mailctl-renew
+      echo "cron installé : /etc/cron.d/mailctl-renew" ;;
+    *) die "usage: mailctl cert http|cloudflare|selfsigned|renew|autorenew" ;;
+  esac
+}
+
+cmd_alias() {
+  case ${1:-} in
+    add) dms alias add "$2" "$3" ;;
+    del) dms alias del "$2" "$3" ;;
+    list) dms alias list ;;
+    *) die "usage: mailctl alias add|del <alias> <cible> | list" ;;
+  esac
+}
+
+# DKIM : génère la clé (RSA 2048, sélecteur "mail") si absente.
+cmd_dkim() {
+  local d=${1:?usage: mailctl dkim <domaine>}
+  dms config dkim domain "$d"
+}
+
+dkim_p() { # valeur p= calculée depuis la clé privée, stable quel que soit le format du fichier public
+  docker exec "$DMS" sh -c "cat /tmp/docker-mailserver/rspamd/dkim/rsa-2048-mail-$1.private.txt" 2>/dev/null |
+    openssl rsa -pubout -outform DER 2>/dev/null | base64 -w0
+}
+
+cmd_dns() {
+  need_env
+  local d=${1:-$MAIL_DOMAIN} ip p
+  ip=$(curl -4fsS https://api.ipify.org 2>/dev/null || echo "<IP_DU_VPS>")
+  p=$(dkim_p "$d") || true
+  cat <<EOF
+Enregistrements DNS pour $d (IP serveur : $ip)
+
+${MAIL_HOSTNAME}.        A      $ip
+$d.                      MX 10  ${MAIL_HOSTNAME}.
+$d.                      TXT    "v=spf1 mx -all"
+_dmarc.$d.               TXT    "v=DMARC1; p=none; rua=mailto:${POSTMASTER_ADDRESS}"
+EOF
+  if [ -n "$p" ]; then echo "mail._domainkey.$d.      TXT    \"v=DKIM1; k=rsa; p=$p\""
+  else echo "mail._domainkey.$d.      TXT    (clé absente : lancer './mailctl dkim $d' puis relancer cette commande)"; fi
+  cat <<EOF
+
+Hors zone DNS, chez l'hébergeur du VPS : PTR (reverse DNS) de $ip -> ${MAIL_HOSTNAME}
+DMARC : passer p=none -> quarantine -> reject après quelques semaines sans problème.
+EOF
+}
+
+cmd_check() {
+  need_env
+  local d=${1:-$MAIL_DOMAIN} ok=0
+  command -v dig >/dev/null || die "dig manquant (apt install dnsutils)"
+  local ip; ip=$(dig +short A "$MAIL_HOSTNAME" | head -1)
+  chk() { if [ -n "$2" ]; then echo "[ OK ] $1: $2"; else echo "[FAIL] $1"; ok=1; fi; }
+  chk "A $MAIL_HOSTNAME" "$ip"
+  chk "MX $d" "$(dig +short MX "$d")"
+  chk "SPF" "$(dig +short TXT "$d" | grep spf1 || true)"
+  chk "DKIM" "$(dig +short TXT "mail._domainkey.$d" | grep DKIM1 || true)"
+  chk "DMARC" "$(dig +short TXT "_dmarc.$d" | grep DMARC1 || true)"
+  [ -n "$ip" ] && chk "PTR $ip" "$(dig +short -x "$ip" | grep -F "$MAIL_HOSTNAME" || true)"
+  for port in 25 465 587 993; do
+    if timeout 5 bash -c "exec 3<>/dev/tcp/${ip:-127.0.0.1}/$port" 2>/dev/null; then echo "[ OK ] port $port"
+    else echo "[FAIL] port $port (pare-feu ? fournisseur qui bloque le 25 ?)"; ok=1; fi
+  done
+  return $ok
+}
+
+cmd_backup() {
+  mkdir -p backups
+  local f="backups/mail-$(date +%F-%H%M).tgz"
+  tar czf "$f" data/config data/mail-data data/mail-state data/webmail
+  ls -1t backups/mail-*.tgz | tail -n +$(( ${BACKUP_KEEP:-7} + 1 )) | xargs -r rm --
+  echo "sauvegarde : $f"
+}
+
+usage() {
+  cat <<'EOF'
+mailctl <commande>
+  init <domaine> [hostname]   prépare .env et data/
+  cert http|cloudflare|selfsigned|renew|autorenew
+  up | down | restart | logs [svc] | status | update
+  add <email> [mdp] | del <email> | passwd <email> | list | quota <email> <ex: 5G>
+  alias add|del <alias> <cible> | alias list
+  dkim <domaine>              génère la clé DKIM
+  dns [domaine]               affiche les enregistrements à créer
+  check [domaine]             vérifie DNS (SPF/DKIM/DMARC/PTR) et ports
+  backup                      archive config + boîtes (rotation BACKUP_KEEP)
+EOF
+}
+
+c=${1:-help}; shift || true
+case $c in
+  init) cmd_init "$@" ;;
+  cert) cmd_cert "$@" ;;
+  up) need_env; docker compose up -d ;;
+  down) docker compose down ;;
+  restart) docker compose restart ;;
+  logs) docker compose logs -f --tail=100 "$@" ;;
+  status) docker compose ps; docker exec "$DMS" supervisorctl status ;;
+  update) docker compose pull && docker compose up -d ;;
+  add) pw=${2:-$(ask_password)}; dms email add "${1:?email}" "$pw" ;;
+  passwd) dms email update "${1:?email}" "$(ask_password)" ;;
+  del) dms email del "${1:?email}" ;;
+  list) dms email list ;;
+  quota) dms quota set "${1:?email}" "${2:?ex: 5G}" ;;
+  alias) cmd_alias "$@" ;;
+  dkim) cmd_dkim "$@" ;;
+  dns) cmd_dns "$@" ;;
+  check) cmd_check "$@" ;;
+  backup) cmd_backup ;;
+  *) usage ;;
+esac
